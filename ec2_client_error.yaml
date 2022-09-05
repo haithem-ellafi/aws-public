@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation Sample Template Cloud9: Sample template showing
+  how to create a Cloud9 Environement. **WARNING** This template
+  creates an Amazon EC2 Instance. You will be
+  billed for the AWS resources used if you create a stack from this template.
+  
+  
+Parameters:
+  PrivateSubnetsId:
+    Description: "Subnet IDs for C9"
+    Type: 'AWS::EC2::Subnet::Id'  
+
+######################
+# Resources section
+######################      
+Resources:
+
+################## PERMISSIONS AND ROLES #################
+  C9LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "The Lambda function needs this permission, to be able a update C9 instance security group"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName:
+          Fn::Join:
+          - ''
+          - - C9LambdaPolicy-
+            - Ref: AWS::Region
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - cloudformation:DescribeStacks
+            - cloudformation:DescribeStackEvents
+            - cloudformation:DescribeStackResource
+            - cloudformation:DescribeStackResources
+            - cloudformation:DescribeStackInstance
+            - ec2:DescribeInstances
+            - ec2:DescribeInstanceStatus
+            - ec2:DescribeSecurityGroups            
+            - ec2:AuthorizeSecurityGroupEgress
+            - ec2:RevokeSecurityGroupEgress
+            - ec2:ModifyInstanceAttribute
+            - ec2:AttachVolume
+            - ec2:CreateVolume
+            - ec2:DeleteVolume
+            - ec2:DescribeVolumeStatus
+            - ec2:DescribeVolumes
+            - ec2:DescribeVolumesModifications
+            - ec2:DetachVolume
+            - ec2:EnableVolumeIO
+            - ec2:ImportVolume
+            - ec2:ModifyVolume
+            - ec2:ModifyVolumeAttribute
+            - ec2:RebootInstances
+            Resource: "*"
+
+################## LAMBDA BOOTSTRAP FUNCTION ################
+  C9BootstrapInstanceLambda:
+    Type: Custom::C9BootstrapInstanceLambda
+    DependsOn: C9LambdaExecutionRole
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      ServiceToken:
+        Fn::GetAtt:
+        - C9BootstrapInstanceLambdaFunction
+        - Arn
+      C9EnvName:
+        Fn::GetAtt:
+          - Cloud9Environment
+          - Name
+      EnvironmentId:
+        Ref: Cloud9Environment
+
+  C9BootstrapInstanceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "No need to specify a VPC, since the Lambda will perform update on the specific C9 security group"    
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - C9LambdaExecutionRole
+        - Arn
+      Runtime: python3.9
+      MemorySize: 500
+      Timeout: '900'
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import boto3
+          import json
+          import os
+          import time
+          import traceback
+          import cfnresponse
+          
+          # Open AWS clients
+          ec2 = boto3.client('ec2')
+          
+          def wait_instance_ready(instance_id):
+              try:
+                  print('[+] Waiting for instance', instance_id, 'to be ready')
+                  waiter=ec2.get_waiter('instance_running')
+                  waiter.wait(InstanceIds=[instance_id])
+                          
+                  print('[+] instance ready')
+                  
+              except Exception as e:
+                  raise
+                  
+          def wait_volume_ready(volume_id):
+              try:
+                  response = ec2.describe_volumes(VolumeIds=[volume_id])
+                  print(response)
+                  
+                  print('[+] Waiting for folume', volume_id, 'to be ready')
+                  #waiter=ec2.get_waiter('volume_available')
+                  #waiter.wait(VolumeIds=[volume_id])
+                  print('[+] Wait 10 min')
+                  time.sleep(600)
+                          
+                  print('[+] volume ready')
+                  
+                  response = ec2.describe_volumes(VolumeIds=[volume_id])
+                  print(response)
+                  
+              except Exception as e:
+                  raise
+          
+          def update_instance_volume(instance_id, NewSize):
+              try:
+                  # Get Volume_Id
+                  ec2_ressource = boto3.resource('ec2')
+                  instance_ressource = ec2_ressource.Instance(instance_id)
+                  for device in instance_ressource.block_device_mappings:
+                      volume = device.get('Ebs')
+                      Volume_Id = volume.get('VolumeId')
+                      
+                  print('[+] Volume_Id : ', Volume_Id)
+                  
+                  # Get Current volume size
+                  volume_obj=ec2_ressource.Volume(Volume_Id)
+                  OldSize=volume_obj.size
+                  print('[+] OldSize : ', OldSize)
+                  
+                  if NewSize > OldSize:
+                      # Wait for volume to be available
+                      print('[+] Wait 5 min')
+                      time.sleep(300)
+                         
+                      # Change Volume size
+                      print('[+] Change Volume size now, Volume_Id:', Volume_Id, ", Size:", NewSize)
+                      response = ec2.modify_volume(
+                          VolumeId=Volume_Id,
+                          Size=NewSize,
+                      )
+                  
+                      print('[+] Wait 2 min')
+                      time.sleep(120)
+                      
+                      #Reboot instance
+                      print('[+] Reboot instance now')
+                      response = ec2.reboot_instances(InstanceIds=[instance_id])
+                  
+                      # Wait for Instance to become ready
+                      wait_instance_ready(instance_id)
+                  
+                      print('[+] Wait 2 min')
+                      time.sleep(120)
+                  
+                      print('[+] Instance ready')
+                      
+                  else:
+                      print('[+] Same size, no volume resize')
+                      
+              except Exception as e:
+                  raise
+          
+          def lambda_handler(event, context):              
+              try:
+                  responseData = {'Success': 'Started bootstrapping for C9 instance'}
+                  if event['RequestType'] in ['Create', 'Update']:                  
+                      # Get the InstanceId of the Cloud9 IDE
+                      print('[+] Get Instance Id')                      
+                      instance = ec2.describe_instances(Filters=[{'Name': 'tag:Name','Values': ['aws-cloud9-'+event['ResourceProperties']['C9EnvName']+'-'+event['ResourceProperties']['EnvironmentId']]}])['Reservations'][0]['Instances'][0]
+                      instance_id = instance['InstanceId']
+                      print('[+] instance_id : ', instance_id)
+                      
+                      if event['RequestType'] == 'Create':
+                          # Wait for Instance to become ready
+                          wait_instance_ready(instance_id)
+                      
+                      ## Update Cloud9 instance volume
+                      print('[+] Update Cloud9 instance volume')
+                      
+                      print('[+] Get new volume size')
+                      NewSize = 20
+                      print('[+] NewSize : ', NewSize)
+                      update_instance_volume(instance_id, NewSize)
+                  
+                  if event['RequestType'] == 'Delete':
+                      print('[+] Delete')
+                      responseData = {'Success': 'Finish bootstrapping for C9 instance'}
+                          
+                  #Send CFN responce
+                  print('[+] Send CFN responce')                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)                      
+                                            
+              except Exception as e:
+                  print('[+] Exception Error : %s' % e)
+                  responseData = {'FAIL': 'Errors in bootstrapping for C9 instance'}
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+
+
+  Cloud9Environment:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties: 
+      Name: !Sub '${AWS::StackName}'
+      AutomaticStopTimeMinutes: 30
+      ConnectionType : CONNECT_SSM
+      ImageId: ubuntu-18.04-x86_64
+      InstanceType: t3.small
+      SubnetId: !Ref PrivateSubnetsId
+
+######################
+# Outputs section
+######################
+Outputs:
+  
+  C9EnvironmentID:
+    Description: The logical ID of the Cloud9 environment
+    Value: !Ref Cloud9Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-C9EnvironmentID'
+      
+  C9EnvironmentName:
+    Description: The name of the Cloud9 environment
+    Value: !GetAtt Cloud9Environment.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-C9EnvironmentName'
+    
+      
